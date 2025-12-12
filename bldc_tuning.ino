@@ -11,6 +11,11 @@ const float M2006_Current_Max = 10000.0f;
 const float M3508_Gear_Reduction = 19.0f;
 const float M2006_Gear_Reduction = 36.0f;
 
+// --- CONFIGURATION ---
+// True = M3508, False = M2006
+// Defaulting all to M3508. Change via Serial or edit here.
+bool isM3508[4] = {true, true, true, true}; 
+
 // --- TUNING VARIABLES ---
 float TUNING_TARGET_RPM = 500.0f; 
 bool enablePlotter = false;
@@ -47,14 +52,19 @@ void PS4_Setup() {
 
 void ProcessMotorFeedback(uint32_t CAN_ID, uint8_t RPM_H, uint8_t RPM_L) { 
   int16_t RPM_Raw = (RPM_H << 8) | RPM_L; 
-  float RPM_True = (float)RPM_Raw / M2006_Gear_Reduction;
   
   if (CAN_ID >= 0x201 && CAN_ID <= 0x204) {
-    currentRPMs[CAN_ID - 0x201] = RPM_True;
+    int motorIdx = CAN_ID - 0x201; // 0 to 3
+    
+    // Select Ratio based on Config
+    float ratio = (isM3508[motorIdx]) ? M3508_Gear_Reduction : M2006_Gear_Reduction;
+    
+    currentRPMs[motorIdx] = (float)RPM_Raw / ratio;
   }
 }
 
-int16_t CalculatePID(float targetRPM, float actualRPM, PID_Config &pid) {
+// Now accepts motorIndex to check which Current Limit to use
+int16_t CalculatePID(float targetRPM, float actualRPM, PID_Config &pid, int motorIdx) {
   float error = targetRPM - actualRPM;
   float P = pid.Kp * error;
   pid.integral += error;
@@ -68,8 +78,11 @@ int16_t CalculatePID(float targetRPM, float actualRPM, PID_Config &pid) {
   
   float output = P + I + D;
   
-  if (output > M2006_Current_Max) output = M2006_Current_Max;
-  if (output < -M2006_Current_Max) output = -M2006_Current_Max;
+  // Select Max Current based on Config
+  float maxCurrent = (isM3508[motorIdx]) ? M3508_Current_Max : M2006_Current_Max;
+
+  if (output > maxCurrent) output = maxCurrent;
+  if (output < -maxCurrent) output = -maxCurrent;
   
   return (int16_t)output;
 }
@@ -82,8 +95,9 @@ void CheckSerialTuning() {
     if (command == '?') {
        Serial.printf("\n--- CURRENT SETTINGS (Target: %.0f) ---\n", TUNING_TARGET_RPM);
        for(int i=0; i<4; i++) {
-         Serial.printf("M%d -> Kp:%.2f  Ki:%.4f  Kd:%.2f\n", 
-                        i+1, pids[i].Kp, pids[i].Ki, pids[i].Kd);
+         const char* typeName = (isM3508[i]) ? "M3508" : "M2006";
+         Serial.printf("M%d [%s] -> Kp:%.2f  Ki:%.4f  Kd:%.2f\n", 
+                        i+1, typeName, pids[i].Kp, pids[i].Ki, pids[i].Kd);
        }
        Serial.println("---------------------------------------");
        while(Serial.available()) Serial.read(); 
@@ -93,8 +107,8 @@ void CheckSerialTuning() {
     // --- COMMAND: TOGGLE PLOTTER ---
     if (command == 'v') {
        enablePlotter = !enablePlotter;
-       if(enablePlotter) Serial.println(">> PLOTTER MODE: ON (Data will spam)");
-       else Serial.println(">> PLOTTER MODE: OFF (Silent)");
+       if(enablePlotter) Serial.println(">> PLOTTER MODE: ON");
+       else Serial.println(">> PLOTTER MODE: OFF");
        while(Serial.available()) Serial.read();
        return;
     }
@@ -108,6 +122,27 @@ void CheckSerialTuning() {
        return;
     }
 
+    // --- COMMAND: MOTOR TYPE (t1_3508 or t1_2006) ---
+    if (command == 't') {
+        int motorID = Serial.parseInt();
+        char separator = Serial.read(); // Read '_'
+        int typeVal = Serial.parseInt(); // Read 3508 or 2006
+        
+        int startIdx = (motorID == 0) ? 0 : motorID - 1;
+        int endIdx   = (motorID == 0) ? 3 : motorID - 1;
+        if (startIdx < 0) startIdx = 0; if (endIdx > 3) endIdx = 3;
+
+        bool newState = (typeVal == 3508); // True if 3508, False if 2006
+        
+        for(int i = startIdx; i <= endIdx; i++) {
+            isM3508[i] = newState;
+        }
+        Serial.printf(">> Set Motor(s) %d to M%d\n", motorID, (newState ? 3508 : 2006));
+        
+        while(Serial.available()) Serial.read(); 
+        return;
+    }
+
     // --- COMMAND: PID UPDATE ---
     int motorID = Serial.parseInt(); 
     char separator = Serial.read(); 
@@ -116,9 +151,7 @@ void CheckSerialTuning() {
 
     int startIdx = (motorID == 0) ? 0 : motorID - 1;
     int endIdx   = (motorID == 0) ? 3 : motorID - 1;
-
-    if (startIdx < 0) startIdx = 0;
-    if (endIdx > 3) endIdx = 3;
+    if (startIdx < 0) startIdx = 0; if (endIdx > 3) endIdx = 3;
 
     for(int i = startIdx; i <= endIdx; i++) {
         switch(command) {
@@ -146,13 +179,14 @@ void setup() {
   Serial.begin(115200);
   PS4_Setup();
   mcp2515.reset();
-  mcp2515.setBitrate(CAN_1000KBPS, MCP_8MHZ); 
+  mcp2515.setBitrate(CAN_1000KBPS, MCP_8MHZ); // Check Crystal! 8 vs 16
   mcp2515.setNormalMode();
   
   Serial.println("--- MULTI-MOTOR TUNING READY ---");
-  Serial.println("  p1_5.0  -> Set M1 Kp to 5.0");
-  Serial.println("  ?       -> View Settings");
-  Serial.println("  v       -> Toggle Graph Data (On/Off)");
+  Serial.println("  p1_5.0   -> Set M1 Kp");
+  Serial.println("  t1_2006  -> Set M1 to M2006 type");
+  Serial.println("  t0_3508  -> Set ALL to M3508 type");
+  Serial.println("  ?        -> View Settings");
 }
 
 void loop() {
@@ -175,13 +209,13 @@ void loop() {
       }
     }
     for(int i=0; i<4; i++) {
-       outputM[i] = CalculatePID(currentTarget, currentRPMs[i], pids[i]);
+       // Pass 'i' (Motor Index) so it knows which Current Limit to use
+       outputM[i] = CalculatePID(currentTarget, currentRPMs[i], pids[i], i);
     }
   }
 
   SendCANCommand(outputM[0], outputM[1], outputM[2], outputM[3]);
 
-  // Only print if 'v' was pressed to enable plotting
   if (enablePlotter) {
     Serial.printf("%.0f,%.0f,%.0f,%.0f,%.0f\n", 
                   currentTarget, currentRPMs[0], currentRPMs[1], currentRPMs[2], currentRPMs[3]);
